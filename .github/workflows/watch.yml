@@ -2,17 +2,18 @@ name: Willhaben Watcher
 
 on:
   schedule:
-    # Каждый час в :07 минут. Меняешь частоту здесь.
-    # Каждые 30 минут:  - cron: "*/30 * * * *"
-    # Каждые 15 минут:  - cron: "*/15 * * * *"
+    # Каждый час в :07. Каждые 30 мин: "*/30 * * * *"
     - cron: "7 * * * *"
-  workflow_dispatch:   # позволяет запускать вручную кнопкой в GitHub
+  workflow_dispatch:
+    inputs:
+      resend_all:
+        description: "Переотправить ВСЕ текущие подходящие объявления (разово)"
+        type: boolean
+        default: false
 
-# Нужно, чтобы workflow мог коммитить обновлённый seen.json обратно в репозиторий
 permissions:
   contents: write
 
-# Не запускать два прогона одновременно
 concurrency:
   group: willhaben-watcher
   cancel-in-progress: false
@@ -36,6 +37,7 @@ jobs:
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RESEND_ALL: ${{ inputs.resend_all }}
         run: python willhaben_watcher.py
 
       - name: Commit seen.json if changed
@@ -45,7 +47,8 @@ jobs:
           if [ -n "$(git status --porcelain seen.json)" ]; then
             git add seen.json
             git commit -m "update seen listings [skip ci]"
-            git push
+            git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
+            git push || echo "::warning::git push не удался (проверь Workflow permissions)"
           else
             echo "seen.json без изменений — коммит не нужен"
           fi
