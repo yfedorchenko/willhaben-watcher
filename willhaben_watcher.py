@@ -64,6 +64,10 @@ CONFIG = {
 
     # Сколько объявлений держать в памяти "уже отправленных" (чтобы seen.json не рос вечно)
     "seen_cap": 4000,
+
+    # Пауза между сообщениями (сек). ~3.5с = ниже лимита группы (~20/мин),
+    # чтобы всплеск новых объявлений не упирался в Telegram 429.
+    "send_interval_sec": 3.5,
 }
 
 # --- Ключевые слова (немецкий) для текстового анализа описаний ---
@@ -130,7 +134,9 @@ SEEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "seen.json"
 # ============================================================================
 
 def send_telegram(text: str) -> bool:
-    """Отправляет сообщение в Telegram. Токен и chat_id — из переменных окружения."""
+    """Отправляет сообщение в Telegram. Токен и chat_id — из переменных окружения.
+    Корректно обрабатывает 429 (Too Many Requests): читает retry_after,
+    ждёт и повторяет, чтобы при всплеске объявлений ничего не потерять."""
     token = os.environ.get("TELEGRAM_TOKEN", "").strip()
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
     if not token or not chat_id:
@@ -139,20 +145,40 @@ def send_telegram(text: str) -> bool:
         print("-" * 60)
         return False
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    try:
-        r = requests.post(url, data={
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": "false",
-        }, timeout=20)
-        if r.status_code != 200:
-            print(f"[ERROR] Telegram {r.status_code}: {r.text[:300]}")
-            return False
-        return True
-    except Exception as e:
-        print(f"[ERROR] Telegram exception: {e}")
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": "false",
+    }
+    for attempt in range(6):
+        try:
+            r = requests.post(url, data=payload, timeout=20)
+        except Exception as e:
+            print(f"[ERROR] Telegram exception: {e}")
+            time.sleep(3)
+            continue
+
+        if r.status_code == 200:
+            return True
+
+        if r.status_code == 429:
+            # лимит скорости (для групп ~20 сообщений/мин) — уважаем retry_after
+            try:
+                retry_after = int(r.json().get("parameters", {}).get("retry_after", 5))
+            except Exception:
+                retry_after = 5
+            wait = retry_after + 1
+            print(f"[WARN] Telegram 429: жду {wait}s и повторяю…")
+            time.sleep(wait)
+            continue
+
+        # прочие ошибки — не ретраим
+        print(f"[ERROR] Telegram {r.status_code}: {r.text[:200]}")
         return False
+
+    print("[ERROR] Telegram: не удалось отправить после нескольких попыток (429).")
+    return False
 
 
 # ============================================================================
@@ -754,7 +780,9 @@ def main():
                     drop_matches += 1
                 else:
                     new_matches += 1
-                time.sleep(1)                     # не долбить Telegram API
+            # пауза после КАЖДОЙ попытки отправки (не только успешной),
+            # чтобы держаться ниже лимита группы и не долбить API
+            time.sleep(CONFIG["send_interval_sec"])
         except Exception as e:
             print(f"[WARN] Пропускаю объявление из-за ошибки обработки: {e}")
             continue
