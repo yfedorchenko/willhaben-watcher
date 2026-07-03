@@ -68,6 +68,10 @@ CONFIG = {
     # Пауза между сообщениями (сек). ~3.5с = ниже лимита группы (~20/мин),
     # чтобы всплеск новых объявлений не упирался в Telegram 429.
     "send_interval_sec": 3.5,
+
+    # Максимум загрузок детальных страниц за один прогон (защита от всплеска).
+    # Обычно новых 1–3, так что редко задействуется; лишние переносятся на след. прогон.
+    "max_detail_fetches": 30,
 }
 
 # --- Ключевые слова (немецкий) для текстового анализа описаний ---
@@ -100,9 +104,14 @@ KW = {
     # стоп-слова (отбрасываем объявление)
     "gemeinde": ["gemeindewohnung", "vormerkschein", "wiener wohnen", "gemeindebau"],
     # ablöse: если есть требование ablöse с суммой — плохо; "keine/ohne ablöse" — хорошо
-    "abloese_bad": ["ablöse", "abloese", "ablöseforderung"],
+    "abloese_bad": ["ablöse", "abloese", "ablöseforderung", "abstandszahlung",
+                    "abzulösen", "ablösevereinbarung", "gegen abstand", "abstandsablöse"],
     "abloese_good": ["keine ablöse", "ohne ablöse", "keine abloese", "ohne abloese",
                      "ablösefrei", "abloesefrei", "keine ablösezahlung"],
+    # "Nachmieter gesucht" почти всегда = Ablöse (за кухню/мебель), а само слово
+    # Ablöse часто только в полном описании. Считаем это Ablöse-риском, но с escape:
+    # если явно написано "ohne/keine Ablöse" — пропускаем.
+    "nachmieter": ["nachmieter", "nachmieterin", "nachmietersuche"],
     # уже зарезервировано/сдано — не присылать. Осторожно: НЕ берём одиночное
     # "vergeben", т.к. "zu vergeben" = наоборот "сдаётся/доступно".
     "reserved": ["reserviert", "bereits vergeben", "schon vergeben",
@@ -185,35 +194,101 @@ def send_telegram(text: str) -> bool:
 #  Загрузка и парсинг Willhaben
 # ============================================================================
 
-def _http_get(url):
-    """
-    Забирает страницу. Приоритет — curl_cffi с имитацией Chrome (лучше проходит
-    анти-бот). Сначала "прогреваем" сессию заходом на главную (получаем cookies),
-    потом запрашиваем страницу поиска. Возвращает (status_code, text).
-    """
-    if HAVE_CFFI:
-        try:
-            s = cffi_requests.Session(impersonate="chrome")
-            # прогрев cookies
+_SESSION = None
+_SESSION_WARM = False
+
+
+def _get_session():
+    """Одна сессия на процесс (cookies переиспользуются для поиска и деталей)."""
+    global _SESSION, _SESSION_WARM
+    if _SESSION is None:
+        if HAVE_CFFI:
             try:
-                s.get("https://www.willhaben.at/iad/immobilien", timeout=30)
+                _SESSION = cffi_requests.Session(impersonate="chrome")
             except Exception:
-                pass
+                _SESSION = requests.Session()
+                _SESSION.headers.update(HEADERS)
+        else:
+            _SESSION = requests.Session()
+            _SESSION.headers.update(HEADERS)
+    if not _SESSION_WARM:
+        try:
+            _SESSION.get("https://www.willhaben.at/iad/immobilien", timeout=30)
+        except Exception:
+            pass
+        _SESSION_WARM = True
+    return _SESSION
+
+
+def http_get_text(url, retries=3):
+    """GET страницы через общую сессию с ретраями. Возвращает (status, text)."""
+    status, text = None, ""
+    for i in range(1, retries + 1):
+        try:
+            s = _get_session()
             r = s.get(url, headers={"Accept-Language": "de-AT,de;q=0.9,en;q=0.8"},
                       timeout=30)
-            return r.status_code, r.text
+            status, text = r.status_code, r.text
         except Exception as e:
-            print(f"[WARN] curl_cffi не сработал ({e}), пробую requests...")
+            print(f"[WARN] Попытка {i}/{retries} ({url[:60]}…): {e}")
+            status = None
+        if status == 200:
+            return status, text
+        if i < retries:
+            time.sleep(i * 4)
+    return status, text
 
-    # fallback: обычный requests
-    s = requests.Session()
-    s.headers.update(HEADERS)
+
+def _strip_html(s):
+    s = re.sub(r"<[^>]+>", " ", s or "")
+    s = re.sub(r"&[a-z]+;", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _extract_description(data):
+    """Из __NEXT_DATA__ детальной страницы вытаскивает полное описание.
+    Берём самый длинный текст среди полей description / DESCRIPTION / BODY_DYN —
+    это почти всегда основное описание объявления (а не короткие врезки)."""
+    candidates = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            name = node.get("name")
+            if isinstance(name, str) and name.upper() in (
+                    "DESCRIPTION", "BODY_DYN", "BODY", "PROPERTY_DESCRIPTION"):
+                for v in (node.get("values") or []):
+                    if isinstance(v, str):
+                        candidates.append(v)
+            d = node.get("description")
+            if isinstance(d, str):
+                candidates.append(d)
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for x in node:
+                walk(x)
+
+    walk(data)
+    return max(candidates, key=len) if candidates else ""
+
+
+def fetch_detail_text(url):
+    """Возвращает полный текст описания объявления (lowercase) с детальной
+    страницы, или '' если не удалось (тогда наверху используется тизер)."""
+    if not url or "willhaben.at" not in url:
+        return ""
+    status, html_text = http_get_text(url, retries=2)
+    if status != 200 or not html_text:
+        return ""
+    m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>',
+                  html_text, re.DOTALL)
+    if not m:
+        return ""
     try:
-        s.get("https://www.willhaben.at/iad/immobilien", timeout=30)
+        data = json.loads(m.group(1))
     except Exception:
-        pass
-    r = s.get(url, timeout=30)
-    return r.status_code, r.text
+        return ""
+    return _strip_html(_extract_description(data)).lower()
 
 
 def fetch_listings():
@@ -224,21 +299,7 @@ def fetch_listings():
     """
     url = CONFIG["search_url"]
     print(f"[INFO] Fetch: {url}  (curl_cffi={'да' if HAVE_CFFI else 'нет'})")
-
-    attempts = 3
-    status, html_text = None, ""
-    for i in range(1, attempts + 1):
-        try:
-            status, html_text = _http_get(url)
-        except Exception as e:
-            print(f"[WARN] Попытка {i}/{attempts}: исключение при запросе: {e}")
-            status = None
-        if status == 200:
-            break
-        if i < attempts:
-            wait = i * 5
-            print(f"[WARN] Попытка {i}/{attempts}: статус {status}. Жду {wait}с и повторяю…")
-            time.sleep(wait)
+    status, html_text = http_get_text(url, retries=3)
 
     if status == 403:
         print("[ERROR] 403 Forbidden после всех попыток — Willhaben заблокировал запрос "
@@ -422,47 +483,50 @@ def has_any(text, keywords):
 #  Фильтрация и оценка
 # ============================================================================
 
-def evaluate(ad):
-    """
-    Возвращает (passed: bool, reasons_reject: list, tags: dict)
-    tags содержит инфо для алерта: preferred features, priority flags и т.д.
-    """
+def evaluate_cheap(ad):
+    """Дешёвые фильтры по данным из выдачи (тизер/заголовок): цена, комнаты,
+    Gemeinde, WG, reserviert. Возвращает (ok, rejects)."""
     reject = []
     text = ad["text"]
 
-    # --- Жёсткие фильтры ---
     if ad["price"] is not None and ad["price"] > CONFIG["price_max"]:
         reject.append(f"цена {ad['price']:.0f}€ > {CONFIG['price_max']}€")
-
     if ad["rooms"] is not None and ad["rooms"] < CONFIG["rooms_min"]:
         reject.append(f"комнат {ad['rooms']:.1f} < {CONFIG['rooms_min']}")
-
     if has_any(text, KW["gemeinde"]):
         reject.append("Gemeindewohnung / Vormerkschein")
-
-    # WG — жёстко вон (в т.ч. WG-geeignet/WG-tauglich)
     if WG_RE.search(text):
         reject.append("WG")
-
     if has_any(text, KW["reserved"]):
         reject.append("уже зарезервировано / сдано")
 
-    # Кухня (вариант Б): НЕ требуем упоминания. Отсекаем только явное отсутствие.
+    return len(reject) == 0, reject
+
+
+def evaluate_text(text, ad):
+    """Фильтры, которым нужен ПОЛНЫЙ текст описания: Ablöse, отсутствие кухни,
+    месяц заезда. text = тизер + полное описание с детальной страницы.
+    Возвращает (ok, rejects)."""
+    reject = []
+
+    # Кухня (вариант Б): отсекаем только явное отсутствие
     if has_any(text, KW["kitchen_negative"]):
         reject.append("явно без кухни")
 
-    # Ablöse: если есть 'ablöse' и НЕТ 'ohne/keine ablöse' — отбрасываем
+    # Ablöse: реальное слово Ablöse/синонимы в полном тексте, но не если ablösefrei
     if has_any(text, KW["abloese_bad"]) and not has_any(text, KW["abloese_good"]):
-        reject.append("возможна Ablöse")
+        reject.append("Ablöse в описании")
 
     # Месяц заезда: отсекаем только если явно поздний месяц
     month = detect_move_in_month(text)
     if month is not None and month >= CONFIG["move_in_reject_from_month"]:
         reject.append(f"заезд с {month:02d} месяца (поздно)")
 
-    passed = len(reject) == 0
+    return len(reject) == 0, reject
 
-    # --- Признаки для карточки (не влияют на passed) ---
+
+def compute_tags(text, ad):
+    """Признаки для карточки + приоритетные флаги (по полному тексту)."""
     tags = {
         "kitchen": has_any(text, KW["kitchen"]),
         "balcony": has_any(text, KW["balcony"]),
@@ -472,34 +536,26 @@ def evaluate(ad):
         "gym": has_any(text, KW["gym"]),
         "all_inclusive": has_any(text, KW["all_inclusive"]),
         "provisionfree": has_any(text, KW["provisionfree"]),
-        "move_in_month": month,
+        "move_in_month": detect_move_in_month(text),
         "move_in_text": extract_move_in_text(text),
-        "priority": [],   # список причин "приоритетно/критично"
+        "priority": [],
     }
-
-    # --- Приоритетные / критичные флаги ---
-    # 3 комнаты дешевле порога
     if (ad["rooms"] is not None and ad["rooms"] >= 3
             and ad["price"] is not None
             and ad["price"] < CONFIG["priority_price_3room"]):
         tags["priority"].append(
             f"3+ комнаты за {ad['price']:.0f}€ (< {CONFIG['priority_price_3room']}€)")
-
-    # Паркоместо/бассейн/спортзал включены
     if tags["parking"]:
         tags["priority"].append("есть паркоместо/гараж")
     if tags["pool"]:
         tags["priority"].append("есть бассейн")
     if tags["gym"]:
         tags["priority"].append("есть спортзал/фитнес")
-
-    # Свет+вода включены в сумму до 1200
     if tags["all_inclusive"] and (ad["price"] is None
                                   or ad["price"] <= CONFIG["price_all_inclusive_max"]):
         tags["priority"].append(
             f"похоже, всё включено (свет/вода) до {CONFIG['price_all_inclusive_max']}€")
-
-    return passed, reject, tags
+    return tags
 
 
 def extract_move_in_text(text):
@@ -719,6 +775,8 @@ def main():
     new_matches = 0
     drop_matches = 0
     repost_skips = 0
+    text_rejects = 0
+    detail_fetches = 0
     checked = 0
     first_run_matches = 0
 
@@ -729,59 +787,79 @@ def main():
                 continue
             checked += 1
 
-            passed, reject, tags = evaluate(ad)
-
+            # 1) Дешёвые фильтры по тизеру (цена, комнаты, WG, Gemeinde, reserviert)
+            cheap_ok, cheap_reject = evaluate_cheap(ad)
             if verbose:
-                status = "PASS" if passed else "skip"
-                pr = " [PRIORITY]" if tags["priority"] else ""
-                print(f"  [{status}]{pr} id={ad['id']} "
-                      f"{ad['price']}€ {ad['rooms']}к — {ad['heading'][:60]}"
-                      + (f"  ({'; '.join(reject)})" if reject else ""))
-
-            if not passed:
-                continue
+                st = "cheap-ok" if cheap_ok else "skip"
+                print(f"  [{st}] id={ad['id']} {ad['price']}€ {ad['rooms']}к — "
+                      f"{ad['heading'][:55]}"
+                      + (f"  ({'; '.join(cheap_reject)})" if cheap_reject else ""))
+            if not cheap_ok:
+                continue   # не запоминаем: если позже подешевеет/изменится — поймаем как новое
 
             ad_id = ad["id"]
             is_new_id = ad_id not in ids
             prev_price = ids.get(ad_id)
             price_drop = (not is_new_id and prev_price is not None
                           and ad["price"] is not None and ad["price"] < prev_price)
-
-            # «Мягкий» репост: новый ID, но точно такой же контент (заголовок+PLZ+
-            # площадь+комнаты+цена) мы уже видели -> это перепубликация -> не шлём.
             sig = signature(ad)
             is_repost = is_new_id and sig is not None and sig in sigs
 
-            # Запоминаем (до решения об отправке)
-            ids[ad_id] = ad["price"]
-            if sig is not None:
-                sigs.add(sig)
+            def remember():
+                ids[ad_id] = ad["price"]
+                if sig is not None:
+                    sigs.add(sig)
 
+            # Первый запуск — только запоминаем, ничего не шлём и детали не грузим
             if first_run:
+                remember()
                 first_run_matches += 1
                 continue
 
-            # Решаем, отправлять ли и в каком виде
-            if resend_all:
-                msg = build_message(ad, tags)
-            elif is_repost:
+            # Мягкий репост (тот же контент и цена под новым ID) — молчим
+            if is_repost and not resend_all:
+                remember()
                 repost_skips += 1
-                continue                          # перепубликация того же — молчим
-            elif is_new_id:
-                msg = build_message(ad, tags)     # новое объявление
-            elif price_drop:
-                msg = build_message(ad, tags, price_drop_from=prev_price)
-            else:
-                continue                          # дубль без снижения цены — пропускаем
+                continue
+
+            # Решаем, кандидат ли на отправку
+            want_send = resend_all or is_new_id or price_drop
+            if not want_send:
+                remember()               # виденный дубль без снижения цены
+                continue
+
+            # 2) Тянем ПОЛНОЕ описание с детальной страницы (для точного фильтра)
+            if detail_fetches >= CONFIG["max_detail_fetches"]:
+                # превысили лимит за прогон — НЕ запоминаем, попробуем в следующий раз
+                print(f"[INFO] Достигнут лимит загрузок деталей ({CONFIG['max_detail_fetches']}), "
+                      f"откладываю id={ad_id} на следующий прогон.")
+                continue
+            detail = fetch_detail_text(ad["link"])
+            detail_fetches += 1
+            full_text = (ad["text"] + " " + detail) if detail else ad["text"]
+            print(f"[detail] id={ad_id}: описание {len(detail)} симв."
+                  + ("" if detail else "  (пусто -> использую тизер)"))
+
+            # 3) Фильтры по полному тексту (Ablöse, отсутствие кухни, месяц заезда)
+            text_ok, text_reject = evaluate_text(full_text, ad)
+            remember()   # запоминаем в любом случае, чтобы не грузить деталь повторно
+            if not text_ok:
+                text_rejects += 1
+                if verbose:
+                    print(f"      -> text-skip: {'; '.join(text_reject)}")
+                continue
+
+            tags = compute_tags(full_text, ad)
+            drop_from = prev_price if (price_drop and not resend_all) else None
+            msg = build_message(ad, tags, price_drop_from=drop_from)
 
             ok = send_telegram(msg)
             if ok:
-                if price_drop:
+                if drop_from is not None:
                     drop_matches += 1
                 else:
                     new_matches += 1
-            # пауза после КАЖДОЙ попытки отправки (не только успешной),
-            # чтобы держаться ниже лимита группы и не долбить API
+            # пауза после КАЖДОЙ попытки отправки (держимся ниже лимита группы)
             time.sleep(CONFIG["send_interval_sec"])
         except Exception as e:
             print(f"[WARN] Пропускаю объявление из-за ошибки обработки: {e}")
@@ -791,11 +869,11 @@ def main():
         save_seen({"ids": ids, "sigs": sigs})
 
     print(f"[DONE] Проверено={checked}, новых={new_matches}, снижений цены={drop_matches}, "
-          f"репостов пропущено={repost_skips}, first_run={first_run}, "
+          f"репостов пропущено={repost_skips}, отсеяно по описанию={text_rejects}, "
+          f"деталей загружено={detail_fetches}, first_run={first_run}, "
           f"resend_all={resend_all}, dry_run={dry_run}")
 
     if first_run and not dry_run:
-        # Подтверждение в Telegram, что всё поднялось и работает end-to-end
         send_telegram(
             "✅ <b>Мониторинг Willhaben запущен</b>\n\n"
             f"Сейчас под критерии подходит <b>{first_run_matches}</b> объявлений — "
