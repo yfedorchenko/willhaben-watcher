@@ -97,10 +97,11 @@ KW = {
                       "inkl. wasser", "wasser inklusive", "all-inclusive",
                       "alle betriebskosten inkl", "inkl. aller kosten",
                       "warmmiete inkl", "pauschalmiete", "all inclusive"],
-    # без комиссии агентства — просто подсвечиваем в карточке
-    "provisionfree": ["provisionsfrei", "provisionsfreie", "provisionsfreier",
-                      "keine provision", "ohne provision", "maklerfrei", "ohne makler",
-                      "0% provision", "keine maklerprovision", "keine maklergebühr"],
+    # мебель (кроме кухни) — подсвечиваем. unmöbliert обрабатываем отдельно (исключаем).
+    "furniture_pos": ["möbliert", "vollmöbliert", "teilmöbliert", "voll möbliert",
+                      "teil möbliert", "möbliertes", "mit möbeln", "inkl. möbel",
+                      "inklusive möbel", "möbel werden übernommen"],
+    "furniture_neg": ["unmöbliert", "nicht möbliert", "ohne möbel", "unmoebliert"],
     # стоп-слова (отбрасываем объявление)
     "gemeinde": ["gemeindewohnung", "vormerkschein", "wiener wohnen", "gemeindebau"],
     # ablöse: если есть требование ablöse с суммой — плохо; "keine/ohne ablöse" — хорошо
@@ -535,7 +536,10 @@ def compute_tags(text, ad):
         "pool": has_any(text, KW["pool"]),
         "gym": has_any(text, KW["gym"]),
         "all_inclusive": has_any(text, KW["all_inclusive"]),
-        "provisionfree": has_any(text, KW["provisionfree"]),
+        "furniture": (has_any(text, KW["furniture_pos"])
+                      and not has_any(text, KW["furniture_neg"])),
+        "befristung": detect_befristung(text),
+        "costs": extract_costs(text),
         "move_in_month": detect_move_in_month(text),
         "move_in_text": extract_move_in_text(text),
         "priority": [],
@@ -583,6 +587,51 @@ def extract_move_in_text(text):
     if m:
         return f"ab {m.group(1)}".title()
     return None
+
+
+def detect_befristung(text):
+    """Срок аренды для карточки: 'unbefristet', 'befristet 3 года' или None."""
+    if re.search(r"unbefristet", text):
+        return "unbefristet (бессрочно)"
+    if re.search(r"befristet|befristung|befristetes|befristeter", text):
+        # длительность — только рядом с befristet/auf/für, чтобы не поймать Baujahr и т.п.
+        for pat in (r"(?:auf|für)\s+(\d{1,2})\s*jahr",
+                    r"befriste\w*\D{0,12}(\d{1,2})\s*jahr",
+                    r"(\d{1,2})\s*jahre?\s*befristet"):
+            m = re.search(pat, text)
+            if m:
+                return f"befristet ~{m.group(1)} г."
+        return "befristet (срочно)"
+    return None
+
+
+def _money(s):
+    """'1.200' / '180,50' / ' 3 300 ' -> число или None (для сумм в тексте)."""
+    v = _to_number(s)
+    return v
+
+
+def extract_costs(text):
+    """Достаёт из полного текста Betriebskosten / Kaution (best-effort).
+    Только для отображения — если не нашли, просто не показываем."""
+    costs = {}
+
+    def clean(s):
+        return re.sub(r"\s+", " ", s).strip(" .,;:-–€")
+
+    m = re.search(r"(?:betriebskosten\w*|\bbk\b)[^0-9€]{0,15}€?\s*"
+                  r"([0-9][0-9.\s]{1,7}(?:,[0-9]{1,2})?)", text)
+    if m:
+        v = _money(m.group(1))
+        if v and 20 <= v <= 3000:      # sanity: похоже на месячные BK
+            costs["bk"] = v
+
+    m = re.search(r"kaution\w*[^0-9a-zä]{0,15}"
+                  r"(\d{1,2}\s*(?:brutto)?monat\w*|€?\s*[0-9][0-9.\s]{2,7}(?:,[0-9]{1,2})?)", text)
+    if m:
+        costs["kaution"] = clean(m.group(1))
+
+    return costs
 
 
 def detect_move_in_month(text):
@@ -657,18 +706,30 @@ def build_message(ad, tags, price_drop_from=None):
     if loc:
         lines.append(f"📍 {e(loc)}")
 
+    # Срок аренды (befristet/unbefristet) — только показываем, не фильтруем
+    if tags.get("befristung"):
+        lines.append(f"📄 {e(tags['befristung'])}")
+
     # Дата заезда
     if tags.get("move_in_text"):
         lines.append(f"📅 заезд: {e(tags['move_in_text'])}")
 
-    # Без комиссии — подсвечиваем
-    if tags.get("provisionfree"):
-        lines.append("💸 <b>без комиссии (provisionsfrei)</b>")
+    # Разбивка платежей (что нашлось в описании)
+    costs = tags.get("costs") or {}
+    cost_bits = []
+    if costs.get("bk"):
+        cost_bits.append(f"BK ~{costs['bk']:.0f} €")
+    if costs.get("kaution"):
+        cost_bits.append(f"Kaution {e(costs['kaution'])}")
+    if cost_bits:
+        lines.append("🧾 " + " · ".join(cost_bits))
 
     # Признаки квартиры
     feats = []
     if tags.get("kitchen"):
         feats.append("🍳 кухня")
+    if tags.get("furniture"):
+        feats.append("🛋 меблированная")
     if tags["balcony"]:
         feats.append("🌇 балкон/терраса")
     if tags["parking"]:
