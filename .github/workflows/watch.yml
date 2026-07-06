@@ -8,13 +8,19 @@ on:
   workflow_dispatch:
     inputs:
       resend_all:
-        description: "Переотправить ВСЕ текущие подходящие объявления (разово)"
+        description: "Переотправить ВСЕ текущие подходящие (включая уже виденные)"
+        type: boolean
+        default: false
+      resend_missed:
+        description: "Переотправить только ПРОПУЩЕННЫЕ (что ещё не отправлялись)"
         type: boolean
         default: false
 
+# Нужно, чтобы workflow мог коммитить обновлённый seen.json обратно в репозиторий
 permissions:
   contents: write
 
+# Не запускать два прогона одновременно
 concurrency:
   group: willhaben-watcher
   cancel-in-progress: false
@@ -25,18 +31,23 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
       - name: Install dependencies
         run: pip install -r requirements.txt
+
       - name: Run watcher
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           RESEND_ALL: ${{ inputs.resend_all }}
+          RESEND_MISSED: ${{ inputs.resend_missed }}
         run: python willhaben_watcher.py
+
       - name: Commit seen.json if changed
         run: |
           git config user.name "willhaben-bot"
@@ -44,6 +55,9 @@ jobs:
           if [ -n "$(git status --porcelain seen.json)" ]; then
             git add seen.json
             git commit -m "update seen listings [skip ci]"
+            # подтягиваем возможные изменения и пушим; не валим прогон если push не удался
             git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
-            git push || echo "::warning::git push не удался (проверь Workflow permissions)"
+            git push || echo "::warning::git push не удался (проверь Workflow permissions = Read and write)"
+          else
+            echo "seen.json без изменений — коммит не нужен"
           fi
