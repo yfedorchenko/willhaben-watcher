@@ -49,6 +49,7 @@ CONFIG = {
     # --- Пороги для доп. уведомлений ---
     "priority_price_3room": 900,   # 3 комнаты дешевле этой цены -> критично-приоритетно
     "price_all_inclusive_max": 1200,  # если в эту сумму входят свет+вода -> приоритетно
+    "abloese_max": 1000,           # Ablöse до этой суммы (включительно) -> ОК, отправляем
 
     # --- Willhaben search URL ---
     # areaId для всей Вены. Можно заменить на конкретный район (см. README).
@@ -159,7 +160,7 @@ def send_telegram(text: str) -> bool:
         "chat_id": chat_id,
         "text": text,
         "parse_mode": "HTML",
-        "disable_web_page_preview": "false",
+        "disable_web_page_preview": "true",
     }
     for attempt in range(6):
         try:
@@ -514,9 +515,9 @@ def evaluate_text(text, ad):
     if has_any(text, KW["kitchen_negative"]):
         reject.append("явно без кухни")
 
-    # Ablöse: реальное слово Ablöse/синонимы в полном тексте, но не если ablösefrei
-    if has_any(text, KW["abloese_bad"]) and not has_any(text, KW["abloese_good"]):
-        reject.append("Ablöse в описании")
+    # Ablöse: отсекаем только если доплата > порога (или сумма неясна)
+    if abloese_blocked(text):
+        reject.append(f"Ablöse > {CONFIG['abloese_max']}€ (или сумма неясна)")
 
     # Месяц заезда: отсекаем только если явно поздний месяц
     month = detect_move_in_month(text)
@@ -540,6 +541,7 @@ def compute_tags(text, ad):
                       and not has_any(text, KW["furniture_neg"])),
         "befristung": detect_befristung(text),
         "costs": extract_costs(text),
+        "abloese_amount": abloese_amount(text),
         "move_in_month": detect_move_in_month(text),
         "move_in_text": extract_move_in_text(text),
         "priority": [],
@@ -562,31 +564,75 @@ def compute_tags(text, ad):
     return tags
 
 
-def extract_move_in_text(text):
-    """Возвращает человекочитаемую дату заезда для карточки ('ab sofort',
-    'ab September', 'ab 01.09.2025') или None, если не нашли."""
-    if re.search(r"\bab\s+sofort\b|sofort\s+bezieh|sofort\s+verfügbar|bezugsfrei\s+ab\s+sofort", text):
-        return "ab sofort"
+# Заезд определяем ТОЛЬКО в контексте доступности (verfügbar/bezugsfrei/frei ab …),
+# чтобы в длинном описании не ловить постороннее ("Besichtigung ab Oktober").
+_MONTHS = {
+    "januar": 1, "jänner": 1, "jaenner": 1, "februar": 2, "februar": 2, "märz": 3,
+    "maerz": 3, "april": 4, "mai": 5, "juni": 6, "juli": 7, "august": 8,
+    "september": 9, "oktober": 10, "november": 11, "dezember": 12,
+}
+_AVAIL = r"(?:verf[üu]gbar|bezugsfrei|beziehbar|bezug|einzug|übergabe|mietbeginn|frei)\s+ab"
+_MONTH_ALT = "|".join(sorted(set(_MONTHS), key=len, reverse=True))
 
-    month_names = ("januar", "jänner", "februar", "märz", "maerz", "april", "mai",
-                   "juni", "juli", "august", "september", "oktober", "november", "dezember")
-    # дата: ab/verfügbar ab 01.09.2025
-    m = re.search(r"(?:verfügbar|bezugsfrei|beziehbar|frei|ab)\s+ab?\s*"
-                  r"(\d{1,2}\.\d{1,2}\.\d{2,4})", text)
-    if not m:
-        m = re.search(r"\bab\s+(\d{1,2}\.\d{1,2}\.\d{2,4})", text)
+
+def parse_move_in(text):
+    """Возвращает (month:int|None, display:str|None). month=0 -> 'ab sofort'.
+    Срабатывает только на реальную доступность, а не на любое 'ab <месяц>'."""
+    if re.search(r"\bab\s+sofort\b|sofort\s+bezieh|sofort\s+verf[üu]gbar|"
+                 r"bezugsfrei\s+ab\s+sofort|ab\s+sofort\s+verf[üu]gbar", text):
+        return 0, "ab sofort"
+    # дата в контексте доступности
+    m = re.search(_AVAIL + r"\s+(\d{1,2})\.(\d{1,2})\.(\d{2,4})", text)
     if m:
-        return f"ab {m.group(1)}"
-    # месяц словом
-    m = re.search(r"\bab\s+(anfang\s+|mitte\s+|ende\s+)?(" + "|".join(month_names) + r")",
-                  text)
+        mm = int(m.group(2))
+        mon = mm if 1 <= mm <= 12 else None
+        return mon, f"ab {m.group(1)}.{m.group(2)}.{m.group(3)}"
+    # месяц словом в контексте доступности
+    m = re.search(_AVAIL + r"\s+(anfang\s+|mitte\s+|ende\s+)?(" + _MONTH_ALT + r")\b", text)
     if m:
-        return f"ab {(m.group(1) or '').strip()} {m.group(2)}".replace("  ", " ").strip().title()
-    m = re.search(r"(?:verfügbar|bezugsfrei|beziehbar|frei)\s+ab\s+(?:\w+\s+)?("
-                  + "|".join(month_names) + r")", text)
-    if m:
-        return f"ab {m.group(1)}".title()
-    return None
+        disp = f"ab {(m.group(1) or '').strip()} {m.group(2)}".replace("  ", " ").strip()
+        return _MONTHS[m.group(2)], disp.title()
+    return None, None
+
+
+_ABLOESE_NONE = re.compile(
+    r"abl[öo]sefrei|abl[öo]se\s+frei|keine\s+abl[öo]se|ohne\s+abl[öo]se|"
+    r"abl[öo]se\w*\s*[:=]?\s*(?:keine?|nein|0(?:[.,]0+)?\b|entf[äa]llt|"
+    r"nicht\s+(?:erforderlich|notwendig|vorhanden)|k\.?\s?a\.?|[-–—])",
+    re.IGNORECASE)
+# сумма сразу после слова Ablöse (не хватает соседний Kaution и т.п.)
+_ABLOESE_AMT = re.compile(
+    r"abl[öo]se\w*\s*(?:i\.?\s?h\.?\s?v\.?|in\s+höhe\s+von|von|muss|betr[äa]gt|ca\.?|:|=)?\s*"
+    r"€?\s*([0-9][0-9.\s]{0,6}(?:,[0-9]{1,2})?)\s*(?:€|eur|euro)?",
+    re.IGNORECASE)
+
+
+def abloese_amount(text):
+    """Максимальная сумма Ablöse рядом с упоминанием, или None если суммы нет."""
+    vals = []
+    for m in _ABLOESE_AMT.finditer(text):
+        v = _to_number(m.group(1))
+        if v is not None and v >= 50:      # мусорную мелочь игнорируем
+            vals.append(v)
+    return max(vals) if vals else None
+
+
+def abloese_blocked(text):
+    """True -> отсекаем. Разрешаем, если Ablöse нет ИЛИ сумма <= abloese_max.
+    Если Ablöse упомянута, но сумму понять нельзя -> перестраховка (отсекаем)."""
+    if _ABLOESE_NONE.search(text):
+        return False                       # явно без доплаты
+    if not has_any(text, KW["abloese_bad"]):
+        return False                       # Ablöse не упоминается
+    amt = abloese_amount(text)
+    if amt is None:
+        return True                        # сумма неясна -> отсекаем
+    return amt > CONFIG["abloese_max"]      # > порога -> отсекаем; <= -> пропускаем
+
+
+def extract_move_in_text(text):
+    """Человекочитаемая дата заезда для карточки, или None."""
+    return parse_move_in(text)[1]
 
 
 def detect_befristung(text):
@@ -596,7 +642,7 @@ def detect_befristung(text):
     if re.search(r"befristet|befristung|befristetes|befristeter", text):
         # длительность — только рядом с befristet/auf/für, чтобы не поймать Baujahr и т.п.
         for pat in (r"(?:auf|für)\s+(\d{1,2})\s*jahr",
-                    r"befriste\w*\D{0,12}(\d{1,2})\s*jahr",
+                    r"befrist\w*\D{0,12}(\d{1,2})\s*jahr",
                     r"(\d{1,2})\s*jahre?\s*befristet"):
             m = re.search(pat, text)
             if m:
@@ -635,36 +681,8 @@ def extract_costs(text):
 
 
 def detect_move_in_month(text):
-    """
-    Пытается вытащить месяц заезда из фраз 'ab september', 'verfügbar ab 01.10.2025',
-    'bezugsfrei ab oktober' и т.п. Возвращает номер месяца или None.
-    'ab sofort' / 'sofort' -> считаем текущим (ранний = ОК) -> вернём 0.
-    """
-    if re.search(r"\bab\s+sofort\b|\bsofort\s+bezieh|\bbezugsfrei\s+ab\s+sofort", text):
-        return 0
-
-    months = {
-        "januar": 1, "jänner": 1, "february": 2, "februar": 2, "märz": 3, "maerz": 3,
-        "april": 4, "mai": 5, "juni": 6, "juli": 7, "august": 8,
-        "september": 9, "oktober": 10, "november": 11, "dezember": 12,
-    }
-    # 'ab september' / 'verfügbar ab september'
-    for name, num in months.items():
-        if re.search(rf"\bab\s+(anfang\s+|mitte\s+|ende\s+)?{name}", text):
-            return num
-        if re.search(rf"(verfügbar|bezugsfrei|beziehbar|frei)\s+ab\s+(\w+\s+)?{name}", text):
-            return num
-
-    # даты вида 01.09.2025 / 1.9.25 после 'ab'
-    m = re.search(r"\bab\s+\d{1,2}\.(\d{1,2})\.\d{2,4}", text)
-    if m:
-        try:
-            mm = int(m.group(1))
-            if 1 <= mm <= 12:
-                return mm
-        except ValueError:
-            pass
-    return None
+    """Месяц заезда (0 = ab sofort) в контексте доступности, или None."""
+    return parse_move_in(text)[0]
 
 
 # ============================================================================
@@ -721,6 +739,8 @@ def build_message(ad, tags, price_drop_from=None):
         cost_bits.append(f"BK ~{costs['bk']:.0f} €")
     if costs.get("kaution"):
         cost_bits.append(f"Kaution {e(costs['kaution'])}")
+    if tags.get("abloese_amount"):
+        cost_bits.append(f"Ablöse ~{tags['abloese_amount']:.0f} €")
     if cost_bits:
         lines.append("🧾 " + " · ".join(cost_bits))
 
@@ -742,10 +762,6 @@ def build_message(ad, tags, price_drop_from=None):
         feats.append("🏋️ фитнес")
     if feats:
         lines.append("✅ " + ", ".join(feats))
-
-    # Kellerabteil — отдельная пометка (по твоей просьбе)
-    if tags["cellar"]:
-        lines.append("ℹ️ <i>Есть упоминание Kellerabteil</i>")
 
     # Приоритетные причины
     if tags["priority"]:
@@ -780,23 +796,27 @@ def signature(ad):
 
 def load_seen():
     """
-    Возвращает {"ids": {id: last_price}, "sigs": set(...)}.
-    Совместимо со старыми форматами: список id  ->  ids={id:None};
-    плоский dict {id: price}  ->  ids=этот dict.
+    Возвращает {"ids": {id: last_price}, "sigs": set(...), "sent": set(...)}.
+    "sent" — id объявлений, которые реально отправлены (для «переотправить пропущенные»).
+    Если "sent" в файле нет (старый формат) — считаем, что всё уже виденное = отправленное
+    (backfill = ids), чтобы «переотправить пропущенные» не завалило старьём.
     """
-    empty = {"ids": {}, "sigs": set()}
+    empty = {"ids": {}, "sigs": set(), "sent": set()}
     if not os.path.exists(SEEN_FILE):
         return empty
     try:
         with open(SEEN_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, list):                       # самый старый формат
-            return {"ids": {str(i): None for i in data}, "sigs": set()}
+            ids = {str(i): None for i in data}
+            return {"ids": ids, "sigs": set(), "sent": set(ids)}
         if isinstance(data, dict) and "ids" in data:     # новый формат
-            return {"ids": {str(k): v for k, v in data.get("ids", {}).items()},
-                    "sigs": set(data.get("sigs", []))}
+            ids = {str(k): v for k, v in data.get("ids", {}).items()}
+            sent = set(data["sent"]) if "sent" in data else set(ids)  # backfill
+            return {"ids": ids, "sigs": set(data.get("sigs", [])), "sent": sent}
         if isinstance(data, dict):                       # промежуточный {id: price}
-            return {"ids": {str(k): v for k, v in data.items()}, "sigs": set()}
+            ids = {str(k): v for k, v in data.items()}
+            return {"ids": ids, "sigs": set(), "sent": set(ids)}
         return empty
     except Exception:
         return empty
@@ -806,8 +826,9 @@ def save_seen(seen):
     cap = CONFIG["seen_cap"]
     ids = dict(list(seen["ids"].items())[-cap:])
     sigs = list(seen["sigs"])[-cap:]
+    sent = list(seen.get("sent", set()))[-cap:]
     with open(SEEN_FILE, "w", encoding="utf-8") as f:
-        json.dump({"ids": ids, "sigs": sigs}, f, ensure_ascii=False)
+        json.dump({"ids": ids, "sigs": sigs, "sent": sent}, f, ensure_ascii=False)
 
 
 # ============================================================================
@@ -820,11 +841,15 @@ def main():
     # RESEND_ALL: разовая переотправка ВСЕХ текущих подходящих (env или флаг)
     resend_all = (os.environ.get("RESEND_ALL", "").strip().lower() in ("1", "true", "yes")
                   or "--resend-all" in sys.argv)
+    # RESEND_MISSED: переотправить только те подходящие, что раньше НЕ отправлялись
+    resend_missed = (os.environ.get("RESEND_MISSED", "").strip().lower() in ("1", "true", "yes")
+                     or "--resend-missed" in sys.argv)
 
-    seen = load_seen()                        # {"ids": {id: price}, "sigs": set()}
+    seen = load_seen()                        # {"ids": {id: price}, "sigs": set(), "sent": set()}
     ids = seen["ids"]
     sigs = seen["sigs"]
-    first_run = (len(ids) == 0) and not resend_all
+    sent = seen["sent"]
+    first_run = (len(ids) == 0) and not resend_all and not resend_missed
 
     adverts = fetch_listings()               # уже с ретраями внутри
     if not adverts:
@@ -884,7 +909,12 @@ def main():
                 continue
 
             # Решаем, кандидат ли на отправку
-            want_send = resend_all or is_new_id or price_drop
+            if resend_all:
+                want_send = True
+            elif resend_missed:
+                want_send = ad_id not in sent      # только не отправленные ранее
+            else:
+                want_send = is_new_id or price_drop
             if not want_send:
                 remember()               # виденный дубль без снижения цены
                 continue
@@ -906,16 +936,16 @@ def main():
             remember()   # запоминаем в любом случае, чтобы не грузить деталь повторно
             if not text_ok:
                 text_rejects += 1
-                if verbose:
-                    print(f"      -> text-skip: {'; '.join(text_reject)}")
+                print(f"      -> ОТСЕЯНО id={ad_id}: {'; '.join(text_reject)}  {ad['link']}")
                 continue
 
             tags = compute_tags(full_text, ad)
-            drop_from = prev_price if (price_drop and not resend_all) else None
+            drop_from = prev_price if (price_drop and not resend_all and not resend_missed) else None
             msg = build_message(ad, tags, price_drop_from=drop_from)
 
             ok = send_telegram(msg)
             if ok:
+                sent.add(ad_id)          # помечаем как реально отправленное
                 if drop_from is not None:
                     drop_matches += 1
                 else:
@@ -927,14 +957,17 @@ def main():
             continue
 
     if not dry_run:
-        save_seen({"ids": ids, "sigs": sigs})
+        save_seen({"ids": ids, "sigs": sigs, "sent": sent})
 
     print(f"[DONE] Проверено={checked}, новых={new_matches}, снижений цены={drop_matches}, "
           f"репостов пропущено={repost_skips}, отсеяно по описанию={text_rejects}, "
           f"деталей загружено={detail_fetches}, first_run={first_run}, "
-          f"resend_all={resend_all}, dry_run={dry_run}")
+          f"resend_all={resend_all}, resend_missed={resend_missed}, dry_run={dry_run}")
 
     if first_run and not dry_run:
+        # на первом запуске всё виденное считаем «отправленным» (иначе resend_missed завалит старьём)
+        sent |= set(ids)
+        save_seen({"ids": ids, "sigs": sigs, "sent": sent})
         send_telegram(
             "✅ <b>Мониторинг Willhaben запущен</b>\n\n"
             f"Сейчас под критерии подходит <b>{first_run_matches}</b> объявлений — "
@@ -947,6 +980,8 @@ def main():
 
     if resend_all and not dry_run:
         print(f"[INFO] resend_all: переотправлено {new_matches} объявлений.")
+    if resend_missed and not dry_run:
+        print(f"[INFO] resend_missed: досланных ранее пропущенных = {new_matches}.")
 
 
 if __name__ == "__main__":
