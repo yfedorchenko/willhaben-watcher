@@ -849,6 +849,7 @@ def main():
     ids = seen["ids"]
     sigs = seen["sigs"]
     sent = seen["sent"]
+    ids_before = set(ids)                     # снимок «что уже видели» — для диагностики окна
     first_run = (len(ids) == 0) and not resend_all and not resend_missed
 
     adverts = fetch_listings()               # уже с ретраями внутри
@@ -864,6 +865,7 @@ def main():
     text_rejects = 0
     detail_fetches = 0
     checked = 0
+    fresh_seen = 0            # сколько из выдачи мы видим ВПЕРВЫЕ (индикатор движения окна)
     first_run_matches = 0
 
     for advert in adverts:
@@ -872,6 +874,8 @@ def main():
             if not ad["id"]:
                 continue
             checked += 1
+            if ad["id"] not in ids_before:
+                fresh_seen += 1
 
             # 1) Дешёвые фильтры по тизеру (цена, комнаты, WG, Gemeinde, reserviert)
             cheap_ok, cheap_reject = evaluate_cheap(ad)
@@ -959,10 +963,11 @@ def main():
     if not dry_run:
         save_seen({"ids": ids, "sigs": sigs, "sent": sent})
 
-    print(f"[DONE] Проверено={checked}, новых={new_matches}, снижений цены={drop_matches}, "
-          f"репостов пропущено={repost_skips}, отсеяно по описанию={text_rejects}, "
-          f"деталей загружено={detail_fetches}, first_run={first_run}, "
-          f"resend_all={resend_all}, resend_missed={resend_missed}, dry_run={dry_run}")
+    print(f"[DONE] Проверено={checked}, свежих_в_выдаче={fresh_seen}, новых={new_matches}, "
+          f"снижений цены={drop_matches}, репостов пропущено={repost_skips}, "
+          f"отсеяно по описанию={text_rejects}, деталей загружено={detail_fetches}, "
+          f"first_run={first_run}, resend_all={resend_all}, resend_missed={resend_missed}, "
+          f"dry_run={dry_run}")
 
     if first_run and not dry_run:
         # на первом запуске всё виденное считаем «отправленным» (иначе resend_missed завалит старьём)
