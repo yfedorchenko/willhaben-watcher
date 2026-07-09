@@ -55,9 +55,13 @@ jobs:
           if [ -n "$(git status --porcelain seen.json)" ]; then
             git add seen.json
             git commit -m "update seen listings [skip ci]"
-            # подтягиваем возможные изменения и пушим; не валим прогон если push не удался
-            git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
-            git push || echo "::warning::git push не удался (проверь Workflow permissions = Read and write)"
+            # до 3 попыток: подтянуть чужие изменения (rebase) и запушить —
+            # на случай гонки между параллельными/очередными прогонами
+            for i in 1 2 3; do
+              git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
+              if git push; then echo "seen.json запушен"; break; fi
+              echo "push не удался, попытка $i"; sleep 3
+            done
           else
             echo "seen.json без изменений — коммит не нужен"
           fi
