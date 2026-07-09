@@ -72,7 +72,7 @@ CONFIG = {
 
     # Максимум загрузок детальных страниц за один прогон (защита от всплеска).
     # Обычно новых 1–3, так что редко задействуется; лишние переносятся на след. прогон.
-    "max_detail_fetches": 30,
+    "max_detail_fetches": 15,
 }
 
 # --- Ключевые слова (немецкий) для текстового анализа описаний ---
@@ -160,7 +160,7 @@ def send_telegram(text: str) -> bool:
         "chat_id": chat_id,
         "text": text,
         "parse_mode": "HTML",
-        "disable_web_page_preview": "true",
+        "disable_web_page_preview": "false",
     }
     for attempt in range(6):
         try:
@@ -222,14 +222,14 @@ def _get_session():
     return _SESSION
 
 
-def http_get_text(url, retries=3):
+def http_get_text(url, retries=3, timeout=30):
     """GET страницы через общую сессию с ретраями. Возвращает (status, text)."""
     status, text = None, ""
     for i in range(1, retries + 1):
         try:
             s = _get_session()
             r = s.get(url, headers={"Accept-Language": "de-AT,de;q=0.9,en;q=0.8"},
-                      timeout=30)
+                      timeout=timeout)
             status, text = r.status_code, r.text
         except Exception as e:
             print(f"[WARN] Попытка {i}/{retries} ({url[:60]}…): {e}")
@@ -237,7 +237,7 @@ def http_get_text(url, retries=3):
         if status == 200:
             return status, text
         if i < retries:
-            time.sleep(i * 4)
+            time.sleep(i * 3)
     return status, text
 
 
@@ -279,7 +279,9 @@ def fetch_detail_text(url):
     страницы, или '' если не удалось (тогда наверху используется тизер)."""
     if not url or "willhaben.at" not in url:
         return ""
-    status, html_text = http_get_text(url, retries=2)
+    # короткий таймаут и одна попытка: если Willhaben троттлит — быстро сдаёмся,
+    # не растягивая прогон (наверху такой кандидат откладывается на следующий раз)
+    status, html_text = http_get_text(url, retries=1, timeout=12)
     if status != 200 or not html_text:
         return ""
     m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>',
@@ -866,6 +868,7 @@ def main():
     detail_fetches = 0
     checked = 0
     fresh_seen = 0            # сколько из выдачи мы видим ВПЕРВЫЕ (индикатор движения окна)
+    consecutive_detail_fail = 0   # подряд неудачных загрузок деталей (для «предохранителя»)
     first_run_matches = 0
 
     for advert in adverts:
@@ -931,9 +934,22 @@ def main():
                 continue
             detail = fetch_detail_text(ad["link"])
             detail_fetches += 1
-            full_text = (ad["text"] + " " + detail) if detail else ad["text"]
-            print(f"[detail] id={ad_id}: описание {len(detail)} симв."
-                  + ("" if detail else "  (пусто -> использую тизер)"))
+            if not detail:
+                # деталь не пришла (троттлинг/сбой). НЕ фильтруем по тизеру и НЕ
+                # запоминаем — отложим до следующего прогона, когда Willhaben ответит.
+                consecutive_detail_fail += 1
+                print(f"[WARN] Деталь не загрузилась id={ad_id} — откладываю "
+                      f"(подряд неудач: {consecutive_detail_fail}).")
+                if consecutive_detail_fail >= 3:
+                    print("[WARN] 3 неудачи подряд — похоже, Willhaben троттлит детали. "
+                          "Прекращаю дозагрузку в этом прогоне, остальных обработаю позже.")
+                    break
+                time.sleep(1)
+                continue
+            consecutive_detail_fail = 0
+            full_text = ad["text"] + " " + detail
+            print(f"[detail] id={ad_id}: описание {len(detail)} симв.")
+            time.sleep(0.7)   # вежливая пауза между детальными страницами
 
             # 3) Фильтры по полному тексту (Ablöse, отсутствие кухни, месяц заезда)
             text_ok, text_reject = evaluate_text(full_text, ad)
